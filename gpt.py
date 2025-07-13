@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from datasets import load_dataset
 import argparse
 from datetime import datetime
@@ -74,6 +74,7 @@ def parse_arguments():
         default="tinystories_bpe_tokenizer/4K",
         help='Tokenizer name or path (e.g., "gpt2" or "tinystories_bpe_tokenizer/1K")',
     )
+    parser.add_argument('--use-torch-compile', action='store_true', help='Use torch.compile for model optimization')
     return parser.parse_args()
 
 
@@ -143,7 +144,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(embedding_dim, 4 * embedding_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(4 * embedding_dim, embedding_dim),
             nn.Dropout(dropout_rate),
         )
@@ -160,12 +161,12 @@ class TransformerBlock(nn.Module):
             num_heads, head_size, context_length, embedding_dim, dropout_rate
         )
         self.feed_forward = FeedForward(embedding_dim, dropout_rate)
-        self.layer_norm1 = nn.LayerNorm(embedding_dim)
-        self.layer_norm2 = nn.LayerNorm(embedding_dim)
+        self.norm1 = nn.RMSNorm(embedding_dim)
+        self.norm2 = nn.RMSNorm(embedding_dim)
 
     def forward(self, inputs):
-        x = inputs + self.multi_head_attention(self.layer_norm1(inputs))
-        x = x + self.feed_forward(self.layer_norm2(x))
+        x = inputs + self.multi_head_attention(self.norm1(inputs))
+        x = x + self.feed_forward(self.norm2(x))
         return x
 
 
@@ -244,7 +245,8 @@ def estimate_loss(
         losses = torch.zeros(eval_iterations)
         for k in range(eval_iterations):
             inputs, targets = get_batch(data, batch_size, context_length, device)
-            _, loss = model(inputs, targets)
+            with torch.amp.autocast('cuda'):
+                _, loss = model(inputs, targets)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -254,6 +256,7 @@ def estimate_loss(
 def main():
     args = parse_arguments()
     torch.manual_seed(1337)
+    torch.set_float32_matmul_precision('high')
 
     # Save model with timestamp and tokenizer info
     tokenizer_name = args.tokenizer.replace("/", "_").replace("\\", "_")
@@ -299,15 +302,28 @@ def main():
         num_heads=args.num_heads,
         dropout_rate=args.dropout_rate,
     ).to(device)
+    
+    if args.use_torch_compile:
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile")
+        except Exception as e:
+            print(f"Error compiling model with torch.compile: {e}")
+            print("Continuing without torch.compile...")
 
     total_params = sum(p.numel() for p in model.parameters())
     embedding_params = sum(p.numel() for p in model.token_embedding.parameters())
     print(
         f"Model parameters: {total_params / 1e6:.2f}M ({embedding_params / 1e6:.2f}M embedding)"
     )
-
     # Setup optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=200,
+        num_training_steps=args.max_iterations
+    )
 
     # Training loop
     for iteration in tqdm(range(args.max_iterations)):
@@ -339,6 +355,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
     model_path = os.path.join(args.output_dir, f"{model_name}.pth")
     torch.save(model.state_dict(), model_path)
