@@ -39,9 +39,9 @@ def parse_arguments():
         "--learning-rate", type=float, default=3e-4, help="Optimizer learning rate"
     )
     parser.add_argument(
-        "--eval-iterations",
+        "--eval-stories",
         type=int,
-        default=100,
+        default=2048,
         help="Number of evaluation iterations",
     )
     parser.add_argument(
@@ -75,6 +75,9 @@ def parse_arguments():
         help='Tokenizer name or path (e.g., "gpt2" or "tinystories_bpe_tokenizer/1K")',
     )
     parser.add_argument('--use-torch-compile', action='store_true', help='Use torch.compile for model optimization')
+    parser.add_argument(
+        "--load", type=str, default=None, help="Path to a pre-trained model checkpoint"
+    )
     return parser.parse_args()
 
 
@@ -237,8 +240,9 @@ def get_batch(data, batch_size, context_length, device):
 
 @torch.no_grad()
 def estimate_loss(
-    model, train_data, val_data, eval_iterations, batch_size, context_length, device
+    model, train_data, val_data, eval_stories, batch_size, context_length, device
 ):
+    eval_iterations = (eval_stories + batch_size - 1) // batch_size
     out = {}
     model.eval()
     for split, data in [("train", train_data), ("val", val_data)]:
@@ -279,20 +283,6 @@ def main():
         print(f"Error loading tokenizer: {e}")
         raise
 
-    # Load dataset
-    dataset = load_dataset("roneneldan/TinyStories")
-    text = "\n".join(dataset["train"]["text"][: args.num_stories])
-
-    # Prepare data
-    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-    train_split = int(0.9 * len(data))
-    train_data = data[:train_split]
-    val_data = data[train_split:]
-
-    print(
-        f"Train data shape: {train_data.shape}, Validation data shape: {val_data.shape}"
-    )
-
     # Initialize model
     model = GPTLanguageModel(
         vocab_size=tokenizer.vocab_size,
@@ -302,6 +292,14 @@ def main():
         num_heads=args.num_heads,
         dropout_rate=args.dropout_rate,
     ).to(device)
+    
+    if args.load:
+        try:
+            model.load_state_dict(torch.load(args.load, map_location=device, weights_only=True))
+            print(f"Loaded pre-trained model from {args.load}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
     
     if args.use_torch_compile:
         try:
@@ -316,6 +314,21 @@ def main():
     print(
         f"Model parameters: {total_params / 1e6:.2f}M ({embedding_params / 1e6:.2f}M embedding)"
     )
+    
+    # Load dataset
+    dataset = load_dataset("roneneldan/TinyStories")
+    text = "\n".join(dataset["train"]["text"][: args.num_stories])
+
+    # Prepare data
+    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+    train_split = int(0.9 * len(data))
+    train_data = data[:train_split]
+    val_data = data[train_split:]
+
+    print(
+        f"Train data shape: {train_data.shape}, Validation data shape: {val_data.shape}"
+    )
+    
     # Setup optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -325,42 +338,63 @@ def main():
         num_training_steps=args.max_iterations
     )
 
-    # Training loop
-    for iteration in tqdm(range(args.max_iterations)):
-        if iteration % args.eval_interval == 0 or iteration == args.max_iterations - 1:
-            losses = estimate_loss(
-                model,
-                train_data,
-                val_data,
-                args.eval_iterations,
-                args.batch_size,
-                args.context_length,
-                device,
-            )
-            # print(
-            #     f"Iteration {iteration}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-            # )
-            tqdm.write(
-                f"Iteration {iteration}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-            )
-            with open(
-                os.path.join(args.output_dir, f"{model_name}_losses.txt"), "a"
-            ) as f:
-                f.write(f"{iteration}\t{losses['train']:.4f}\t{losses['val']:.4f}\n")
+    try:
+        # Training loop
+        for iteration in tqdm(range(args.max_iterations)):
+            if iteration % args.eval_interval == 0 or iteration == args.max_iterations - 1:
+                losses = estimate_loss(
+                    model,
+                    train_data,
+                    val_data,
+                    args.eval_stories,
+                    args.batch_size,
+                    args.context_length,
+                    device,
+                )
+                # print(
+                #     f"Iteration {iteration}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                # )
+                tqdm.write(
+                    f"Iteration {iteration}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                )
+                with open(
+                    os.path.join(args.output_dir, f"{model_name}_losses.txt"), "a"
+                ) as f:
+                    f.write(f"{iteration}\t{losses['train']:.4f}\t{losses['val']:.4f}\n")
 
-        inputs, targets = get_batch(
-            train_data, args.batch_size, args.context_length, device
+            inputs, targets = get_batch(
+                train_data, args.batch_size, args.context_length, device
+            )
+            logits, loss = model(inputs, targets)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving model...")
+        losses = estimate_loss(
+            model,
+            train_data,
+            val_data,
+            args.eval_stories,
+            args.batch_size,
+            args.context_length,
+            device,
         )
-        logits, loss = model(inputs, targets)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+        print(
+            f"Iteration {iteration}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+        )
+        with open(
+            os.path.join(args.output_dir, f"{model_name}_losses.txt"), "a"
+        ) as f:
+            f.write(f"{iteration}\t{losses['train']:.4f}\t{losses['val']:.4f}\n")
 
-    model_path = os.path.join(args.output_dir, f"{model_name}.pth")
-    torch.save(model.state_dict(), model_path)
-    print(f"\nModel saved to {model_path}")
+    if args.max_iterations != 0:
+        model_path = os.path.join(args.output_dir, f"{model_name}.pth")
+        torch.save(model.state_dict(), model_path)
+        print(f"\nModel saved to {model_path}")
 
+    model.eval()
     # Generate sample output
     context = torch.tensor(
         tokenizer.encode("Once\n"), dtype=torch.long, device=device
@@ -372,11 +406,12 @@ def main():
     print("\nGenerated sample:")
     print(generated_text)
 
-    # Save generated text
-    generated_text_path = os.path.join(args.output_dir, f"{model_name}_generated.txt")
-    with open(generated_text_path, "w") as f:
-        f.write(generated_text)
-    print(f"Generated text saved to {generated_text_path}")
+    if args.max_iterations != 0:
+        # Save generated text
+        generated_text_path = os.path.join(args.output_dir, f"{model_name}_generated.txt")
+        with open(generated_text_path, "w") as f:
+            f.write(generated_text)
+        print(f"Generated text saved to {generated_text_path}")
 
 
 if __name__ == "__main__":
